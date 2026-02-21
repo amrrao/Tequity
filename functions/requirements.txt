@@ -1,0 +1,7 @@
+firebase-functions>=0.1.0
+firebase-admin>=6.5.0
+langgraph>=0.2.0
+langgraph-checkpoint-firestore>=0.1.7
+langchain-google-genai>=2.0.0
+langchain-core>=0.3.0
+google-cloud-firestore>=2.16.0
