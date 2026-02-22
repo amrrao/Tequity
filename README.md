@@ -13,11 +13,12 @@ Mac iMessage Server
         ▼
   LangGraph Orchestrator
         │
-        ├── Loads patient context from Firestore
-        ├── Gemini classifies: task type + urgency + summary
-        ├── Writes task card to Firestore (navigator dashboard reads this)
-        ├── Returns ack message → Mac sends to patient immediately
-        └── PAUSES (state saved to Firestore)
+  ├── Loads patient context from Firestore
+  ├── Gemini classifies: task type + urgency + summary
+  ├── Persists the inbound patient message in `messages/{messageId}` (for threading)
+  ├── Writes task card to Firestore (navigator dashboard reads this)
+  ├── Returns ack message → Mac sends to patient immediately (includes `messageId`)
+  └── PAUSES (state saved to Firestore)
 
 Navigator Dashboard
         │
@@ -26,8 +27,9 @@ Navigator Dashboard
         ▼
   LangGraph Resumes
         │
-        ├── Marks task as completed in Firestore
-        └── Returns final message → Mac sends to patient
+  ├── Persists the navigator reply to `messages/{messageId}` with `replyToMessageId` set
+  ├── Marks task as completed in Firestore (stores `replyMessageId`)
+  └── Returns final message → Mac sends to patient (includes `replyToMessageId` so iMessage can thread)
 ```
 
 ---
@@ -52,7 +54,8 @@ Called by the **Mac iMessage server** every time a patient sends a message.
 {
   "patientId":      "patient_001",
   "conversationId": "conv_001",
-  "message":        "Hi, can you help me reschedule my chemo from Tuesday to Friday?"
+  "message":        "Hi, can you help me reschedule my chemo from Tuesday to Friday?",
+  "replyToMessageId": "optional-message-uuid"   // optional: present when the patient is replying to a specific iMessage bubble
 }
 ```
 
@@ -66,6 +69,7 @@ Called by the **Mac iMessage server** every time a patient sends a message.
 ```json
 {
   "success":    true,
+  "messageId":  "uuid-of-this-inbound-message",
   "ackMessage": "Got it! I'm passing this to your care navigator right now. We'll get back to you shortly.",
   "taskId":     "uuid-of-the-created-task",
   "urgency":    "routine"
@@ -100,6 +104,21 @@ A new document is created in the `tasks` collection:
 }
 ```
 
+Additionally, the inbound iMessage is stored in a new `messages` collection for threading:
+
+```json
+{
+  "messageId": "uuid-of-this-inbound-message",
+  "conversationId": "conv_001",
+  "patientId": "patient_001",
+  "sender": "patient",
+  "body": "Hi, can you help me reschedule my chemo from Tuesday to Friday?",
+  "replyToMessageId": null, // or the messageId the patient replied to
+  "taskId": "uuid-of-the-created-task",
+  "createdAt": "timestamp"
+}
+```
+
 ---
 
 ## Endpoint 2: `POST /navigator_reply`
@@ -110,7 +129,8 @@ Called by the **navigator dashboard** when the navigator has handled the task an
 ```json
 {
   "conversationId":    "conv_001",
-  "navigatorResponse": "Hi Maria! I've moved your chemo appointment to Friday at 2pm at the oncology clinic. You'll get a confirmation from them shortly."
+  "navigatorResponse": "Hi Maria! I've moved your chemo appointment to Friday at 2pm at the oncology clinic. You'll get a confirmation from them shortly.",
+  "replyToMessageId":  "optional-message-uuid" // optional: let the navigator explicitly thread to a specific patient message
 }
 ```
 
@@ -123,7 +143,8 @@ Called by the **navigator dashboard** when the navigator has handled the task an
 ```json
 {
   "success":      true,
-  "finalMessage": "Hi Maria! I've moved your chemo appointment to Friday at 2pm at the oncology clinic. You'll get a confirmation from them shortly."
+  "finalMessage": "Hi Maria! I've moved your chemo appointment to Friday at 2pm at the oncology clinic. You'll get a confirmation from them shortly.",
+  "replyToMessageId": "original-message-uuid"
 }
 ```
 
@@ -140,6 +161,8 @@ The task document is updated:
   "updatedAt":         "timestamp"
 }
 ```
+
+The navigator's reply is also stored in `messages/{replyMessageId}` and the task gains a `replyMessageId` field pointing to that message. The `replyToMessageId` links the navigator's message back to the original patient message so the iMessage client can thread the reply to the correct bubble.
 
 ---
 

@@ -55,6 +55,8 @@ class ArulState(TypedDict):
     ack_message: str
     navigator_response: Optional[str]
     final_message: str
+    message_id: str
+    reply_to_message_id: Optional[str]
 
 
 # ── Lazy singletons ──────────────────────────────────────────────────────────
@@ -156,10 +158,24 @@ def supervisor_node(state: ArulState) -> dict:
 def write_task_node(state: ArulState) -> dict:
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
+    msg_id = state["message_id"]
+
+    db.collection("messages").document(msg_id).set({
+        "messageId":      msg_id,
+        "conversationId": state["conversation_id"],
+        "patientId":      state["patient_id"],
+        "sender":         "patient",
+        "body":           state["raw_message"],
+        "replyToMessageId": state.get("reply_to_message_id") or None,
+        "taskId":         state["task_id"],
+        "createdAt":      now,
+    })
+
     db.collection("tasks").document(state["task_id"]).set({
         "taskId":              state["task_id"],
         "patientId":           state["patient_id"],
         "conversationId":      state["conversation_id"],
+        "messageId":           msg_id,
         "patientName":         state["patient_name"],
         "rawMessage":          state["raw_message"],
         "taskType":            state["task_type"],
@@ -185,6 +201,7 @@ def wait_for_navigator_node(state: ArulState) -> dict:
     navigator_response = interrupt({
         "waiting_for": "navigator_response",
         "taskId":      state["task_id"],
+        "messageId":   state["message_id"],
         "patientName": state["patient_name"],
         "summary":     state["summary"],
     })
@@ -195,16 +212,30 @@ def format_reply_node(state: ArulState) -> dict:
     db = get_db()
     reply = (state.get("navigator_response") or "").strip() or "Your navigator will follow up shortly."
     now = firestore.SERVER_TIMESTAMP
+
+    reply_msg_id = str(uuid.uuid4())
+    db.collection("messages").document(reply_msg_id).set({
+        "messageId":        reply_msg_id,
+        "conversationId":   state["conversation_id"],
+        "patientId":        state["patient_id"],
+        "sender":           "navigator",
+        "body":             reply,
+        "replyToMessageId": state["message_id"],
+        "taskId":           state["task_id"],
+        "createdAt":        now,
+    })
+
     db.collection("tasks").document(state["task_id"]).update({
-        "status":            "completed",
-        "navigatorResponse": state["navigator_response"],
-        "updatedAt":         now,
+        "status":             "completed",
+        "navigatorResponse":  state["navigator_response"],
+        "replyMessageId":     reply_msg_id,
+        "updatedAt":          now,
     })
     db.collection("conversations").document(state["conversation_id"]).set(
         {"status": "resolved", "lastActivity": now},
         merge=True,
     )
-    return {"final_message": reply}
+    return {"final_message": reply, "reply_to_message_id": state["message_id"]}
 
 
 def build_graph(checkpointer):
@@ -247,29 +278,33 @@ def message(req: https_fn.Request) -> https_fn.Response:
                 json.dumps({"error": "Missing: patientId, conversationId, message"}),
                 status=400, mimetype="application/json",
             )
+        message_id = str(uuid.uuid4())
         graph = get_graph()
         result = graph.invoke(
             {
-                "raw_message":        raw_message,
-                "patient_id":         patient_id,
-                "conversation_id":    conversation_id,
-                "patient_name":       "",
-                "patient_context":    {},
-                "task_id":            "",
-                "task_type":          "unclear",
-                "urgency":            "routine",
-                "summary":            "",
-                "navigator_notes":    "",
-                "extracted_entities": {},
-                "ack_message":        "",
-                "navigator_response": None,
-                "final_message":      "",
+                "raw_message":          raw_message,
+                "patient_id":           patient_id,
+                "conversation_id":      conversation_id,
+                "patient_name":         "",
+                "patient_context":      {},
+                "task_id":              "",
+                "task_type":            "unclear",
+                "urgency":              "routine",
+                "summary":              "",
+                "navigator_notes":      "",
+                "extracted_entities":   {},
+                "ack_message":          "",
+                "navigator_response":   None,
+                "final_message":        "",
+                "message_id":           message_id,
+                "reply_to_message_id":  None,
             },
             {"configurable": {"thread_id": conversation_id}},
         )
         return https_fn.Response(
             json.dumps({
                 "success":    True,
+                "messageId":  result["message_id"],
                 "ackMessage": result["ack_message"],
                 "taskId":     result["task_id"],
                 "urgency":    result["urgency"],
@@ -299,6 +334,7 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
         body               = req.get_json(silent=True) or {}
         conversation_id    = str(body.get("conversationId", "")).strip()
         navigator_response = str(body.get("navigatorResponse", "")).strip()
+        reply_to_msg_id    = str(body.get("replyToMessageId", "")).strip() or None
         if not all([conversation_id, navigator_response]):
             return https_fn.Response(
                 json.dumps({"error": "Missing: conversationId, navigatorResponse"}),
@@ -310,7 +346,11 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
             {"configurable": {"thread_id": conversation_id}},
         )
         return https_fn.Response(
-            json.dumps({"success": True, "finalMessage": result["final_message"]}),
+            json.dumps({
+                "success":          True,
+                "finalMessage":     result["final_message"],
+                "replyToMessageId": result.get("reply_to_message_id") or reply_to_msg_id,
+            }),
             status=200, mimetype="application/json",
         )
     except Exception as e:
