@@ -54,6 +54,7 @@ class ArulState(TypedDict):
     extracted_entities: dict
     ack_message: str
     navigator_response: Optional[str]
+    navigator_action: Optional[str]
     final_message: str
     message_id: str
     reply_to_message_id: Optional[str]
@@ -198,14 +199,101 @@ def write_task_node(state: ArulState) -> dict:
 
 
 def wait_for_navigator_node(state: ArulState) -> dict:
-    navigator_response = interrupt({
+    response = interrupt({
         "waiting_for": "navigator_response",
         "taskId":      state["task_id"],
         "messageId":   state["message_id"],
         "patientName": state["patient_name"],
         "summary":     state["summary"],
     })
-    return {"navigator_response": navigator_response}
+    if isinstance(response, dict):
+        action = response.get("action", "resolve")
+        message = response.get("message", "")
+    else:
+        action = "resolve"
+        message = response
+    return {"navigator_response": message, "navigator_action": action}
+
+
+def send_followup_node(state: ArulState) -> dict:
+    """Navigator asked a follow-up question. Send it to the patient and wait for their reply."""
+    db = get_db()
+    now = firestore.SERVER_TIMESTAMP
+    question = (state.get("navigator_response") or "").strip()
+
+    # Persist the navigator's follow-up question as a message
+    followup_msg_id = str(uuid.uuid4())
+    db.collection("messages").document(followup_msg_id).set({
+        "messageId":        followup_msg_id,
+        "conversationId":   state["conversation_id"],
+        "patientId":        state["patient_id"],
+        "sender":           "navigator",
+        "body":             question,
+        "replyToMessageId": state["message_id"],
+        "taskId":           state["task_id"],
+        "createdAt":        now,
+    })
+
+    # Mark task as awaiting patient response
+    db.collection("tasks").document(state["task_id"]).update({
+        "status":            "awaiting_patient",
+        "navigatorResponse": question,
+        "replyMessageId":    followup_msg_id,
+        "updatedAt":         now,
+    })
+    db.collection("conversations").document(state["conversation_id"]).set(
+        {"status": "awaiting_patient", "lastActivity": now},
+        merge=True,
+    )
+
+    # Interrupt - wait for the patient to reply
+    patient_reply = interrupt({
+        "waiting_for":       "patient_reply",
+        "taskId":            state["task_id"],
+        "followupMessageId": followup_msg_id,
+        "question":          question,
+    })
+
+    # ── Patient has replied — persist and re-surface for navigator ──
+    new_msg_id = str(uuid.uuid4())
+    now2 = firestore.SERVER_TIMESTAMP
+
+    db.collection("messages").document(new_msg_id).set({
+        "messageId":        new_msg_id,
+        "conversationId":   state["conversation_id"],
+        "patientId":        state["patient_id"],
+        "sender":           "patient",
+        "body":             patient_reply,
+        "replyToMessageId": followup_msg_id,
+        "taskId":           state["task_id"],
+        "createdAt":        now2,
+    })
+
+    db.collection("tasks").document(state["task_id"]).update({
+        "status":           "pending",
+        "rawMessage":       patient_reply,
+        "patientReply":     patient_reply,
+        "imessageDelivered": False,
+        "updatedAt":        now2,
+    })
+    db.collection("conversations").document(state["conversation_id"]).set(
+        {"status": "awaiting_navigator", "lastActivity": now2, "lastMessage": patient_reply},
+        merge=True,
+    )
+
+    return {
+        "raw_message":        patient_reply,
+        "message_id":         new_msg_id,
+        "navigator_response": None,
+        "navigator_action":   None,
+    }
+
+
+def route_after_navigator(state: ArulState) -> str:
+    """Route to followup loop or final reply based on navigator action."""
+    if state.get("navigator_action") == "followup":
+        return "send_followup"
+    return "format_reply"
 
 
 def format_reply_node(state: ArulState) -> dict:
@@ -244,12 +332,15 @@ def build_graph(checkpointer):
     g.add_node("supervisor",         supervisor_node)
     g.add_node("write_task",         write_task_node)
     g.add_node("wait_for_navigator", wait_for_navigator_node)
+    g.add_node("send_followup",      send_followup_node)
     g.add_node("format_reply",       format_reply_node)
     g.add_edge(START,                "intake")
     g.add_edge("intake",             "supervisor")
     g.add_edge("supervisor",         "write_task")
     g.add_edge("write_task",         "wait_for_navigator")
-    g.add_edge("wait_for_navigator", "format_reply")
+    g.add_conditional_edges("wait_for_navigator", route_after_navigator,
+                            {"send_followup": "send_followup", "format_reply": "format_reply"})
+    g.add_edge("send_followup",      "wait_for_navigator")  # loop back
     g.add_edge("format_reply",       END)
     return g.compile(checkpointer=checkpointer)
 
@@ -295,6 +386,7 @@ def message(req: https_fn.Request) -> https_fn.Response:
                 "extracted_entities":   {},
                 "ack_message":          "",
                 "navigator_response":   None,
+                "navigator_action":     None,
                 "final_message":        "",
                 "message_id":           message_id,
                 "reply_to_message_id":  None,
@@ -334,6 +426,7 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
         body               = req.get_json(silent=True) or {}
         conversation_id    = str(body.get("conversationId", "")).strip()
         navigator_response = str(body.get("navigatorResponse", "")).strip()
+        action             = str(body.get("action", "resolve")).strip()
         reply_to_msg_id    = str(body.get("replyToMessageId", "")).strip() or None
         if not all([conversation_id, navigator_response]):
             return https_fn.Response(
@@ -341,15 +434,70 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
                 status=400, mimetype="application/json",
             )
         graph = get_graph()
+        resume_data = {"action": action, "message": navigator_response}
         result = graph.invoke(
-            Command(resume=navigator_response),
+            Command(resume=resume_data),
+            {"configurable": {"thread_id": conversation_id}},
+        )
+        if action == "followup":
+            return https_fn.Response(
+                json.dumps({
+                    "success": True,
+                    "status":  "awaiting_patient",
+                    "followupMessage": navigator_response,
+                }),
+                status=200, mimetype="application/json",
+            )
+        return https_fn.Response(
+            json.dumps({
+                "success":          True,
+                "status":           "completed",
+                "finalMessage":     result["final_message"],
+                "replyToMessageId": result.get("reply_to_message_id") or reply_to_msg_id,
+            }),
+            status=200, mimetype="application/json",
+        )
+    except Exception as e:
+        return https_fn.Response(
+            json.dumps({"success": False, "error": str(e)}),
+            status=500, mimetype="application/json",
+        )
+
+
+@https_fn.on_request(
+    region="us-central1",
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    min_instances=0,
+    max_instances=10,
+    secrets=["GOOGLE_API_KEY"],
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+)
+def patient_reply(req: https_fn.Request) -> https_fn.Response:
+    """Resume the graph when a patient replies to a navigator's follow-up question."""
+    if req.method != "POST":
+        return https_fn.Response("Method not allowed", status=405)
+    try:
+        body            = req.get_json(silent=True) or {}
+        conversation_id = str(body.get("conversationId", "")).strip()
+        raw_message     = str(body.get("message", "")).strip()
+        patient_id      = str(body.get("patientId", "")).strip()
+        if not all([conversation_id, raw_message, patient_id]):
+            return https_fn.Response(
+                json.dumps({"error": "Missing: conversationId, message, patientId"}),
+                status=400, mimetype="application/json",
+            )
+        graph = get_graph()
+        result = graph.invoke(
+            Command(resume=raw_message),
             {"configurable": {"thread_id": conversation_id}},
         )
         return https_fn.Response(
             json.dumps({
-                "success":          True,
-                "finalMessage":     result["final_message"],
-                "replyToMessageId": result.get("reply_to_message_id") or reply_to_msg_id,
+                "success":   True,
+                "status":    "awaiting_navigator",
+                "messageId": result.get("message_id"),
+                "taskId":    result.get("task_id"),
             }),
             status=200, mimetype="application/json",
         )
