@@ -5,7 +5,7 @@ import random
 from typing import TypedDict, Optional
 
 import firebase_admin
-from firebase_admin import firestore
+from firebase_admin import auth as fb_auth, firestore
 from firebase_functions import https_fn, options
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
@@ -61,8 +61,6 @@ class ArulState(TypedDict):
 
 
 # ── Lazy singletons ──────────────────────────────────────────────────────────
-# Nothing initialises at import time — Firebase isn't ready then.
-# Everything is created on first request and reused across warm invocations.
 
 _db = None
 _llm = None
@@ -96,7 +94,7 @@ def get_graph():
         return _graph
     if not firebase_admin._apps:
         firebase_admin.initialize_app()
-    
+
     checkpointer = FirestoreSaver(
         project_id=os.environ.get("GCLOUD_PROJECT"),
         checkpoints_collection="lg_checkpoints",
@@ -104,6 +102,63 @@ def get_graph():
     )
     _graph = build_graph(checkpointer)
     return _graph
+
+
+# ── Navigator auth guard ─────────────────────────────────────────────────────
+
+def _require_navigator(req: https_fn.Request) -> dict:
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message="Missing or malformed Authorization header.",
+        )
+
+    id_token = auth_header[len("Bearer "):]
+    try:
+        decoded = fb_auth.verify_id_token(id_token)
+    except Exception:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message="Invalid or expired ID token.",
+        )
+
+    uid = decoded.get("uid") or decoded.get("sub")
+    if not uid:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message="Token contains no uid.",
+        )
+
+    db = get_db()
+    nav_doc = db.collection("navigators").document(uid).get()
+    if not nav_doc.exists:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message="User is not a registered navigator.",
+        )
+
+    nav_data = nav_doc.to_dict()
+    if not nav_data.get("approved"):
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message="Navigator account is pending approval.",
+        )
+
+    return nav_data
+
+
+def _error_response(err: https_fn.HttpsError) -> https_fn.Response:
+    """Convert an HttpsError into a plain JSON 403/401 response."""
+    unauthenticated_codes = {
+        https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+    }
+    status = 401 if err.code in unauthenticated_codes else 403
+    return https_fn.Response(
+        json.dumps({"success": False, "error": err.message}),
+        status=status,
+        mimetype="application/json",
+    )
 
 
 # ── Nodes ────────────────────────────────────────────────────────────────────
@@ -192,13 +247,13 @@ def write_task_node(state: ArulState) -> dict:
         "updatedAt":           now,
     })
     db.collection("conversations").document(state["conversation_id"]).set(
-    {
-        "lastActivity": now,
-        "lastMessage": state["raw_message"],
-        "status": "awaiting_navigator",
-        "patientId": state["patient_id"],
-    },
-    merge=True,
+        {
+            "lastActivity": now,
+            "lastMessage": state["raw_message"],
+            "status": "awaiting_navigator",
+            "patientId": state["patient_id"],
+        },
+        merge=True,
     )
     ack = URGENT_ACK if state["urgency"] == "urgent" else random.choice(ACK_MESSAGES)
     return {"ack_message": ack}
@@ -222,12 +277,10 @@ def wait_for_navigator_node(state: ArulState) -> dict:
 
 
 def send_followup_node(state: ArulState) -> dict:
-    """Navigator asked a follow-up question. Send it to the patient and wait for their reply."""
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
     question = (state.get("navigator_response") or "").strip()
 
-    # Persist the navigator's follow-up question as a message
     followup_msg_id = str(uuid.uuid4())
     db.collection("messages").document(followup_msg_id).set({
         "messageId":        followup_msg_id,
@@ -240,7 +293,6 @@ def send_followup_node(state: ArulState) -> dict:
         "createdAt":        now,
     })
 
-    # Mark task as awaiting patient response
     db.collection("tasks").document(state["task_id"]).update({
         "status":            "awaiting_patient",
         "navigatorResponse": question,
@@ -252,7 +304,6 @@ def send_followup_node(state: ArulState) -> dict:
         merge=True,
     )
 
-    # Interrupt - wait for the patient to reply
     patient_reply = interrupt({
         "waiting_for":       "patient_reply",
         "taskId":            state["task_id"],
@@ -260,7 +311,6 @@ def send_followup_node(state: ArulState) -> dict:
         "question":          question,
     })
 
-    # ── Patient has replied — persist and re-surface for navigator ──
     new_msg_id = str(uuid.uuid4())
     now2 = firestore.SERVER_TIMESTAMP
 
@@ -296,7 +346,6 @@ def send_followup_node(state: ArulState) -> dict:
 
 
 def route_after_navigator(state: ArulState) -> str:
-    """Route to followup loop or final reply based on navigator action."""
     if state.get("navigator_action") == "followup":
         return "send_followup"
     return "format_reply"
@@ -346,7 +395,7 @@ def build_graph(checkpointer):
     g.add_edge("write_task",         "wait_for_navigator")
     g.add_conditional_edges("wait_for_navigator", route_after_navigator,
                             {"send_followup": "send_followup", "format_reply": "format_reply"})
-    g.add_edge("send_followup",      "wait_for_navigator")  # loop back
+    g.add_edge("send_followup",      "wait_for_navigator")
     g.add_edge("format_reply",       END)
     return g.compile(checkpointer=checkpointer)
 
@@ -426,8 +475,17 @@ def message(req: https_fn.Request) -> https_fn.Response:
     cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST", "OPTIONS"]),
 )
 def navigator_reply(req: https_fn.Request) -> https_fn.Response:
+    if req.method == "OPTIONS":
+        return https_fn.Response("", status=204)
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
+
+    # ── Verify the caller is an approved navigator ───────────────────────────
+    try:
+        _require_navigator(req)
+    except https_fn.HttpsError as e:
+        return _error_response(e)
+
     try:
         body               = req.get_json(silent=True) or {}
         conversation_id    = str(body.get("conversationId", "")).strip()
