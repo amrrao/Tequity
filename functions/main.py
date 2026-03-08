@@ -67,11 +67,15 @@ _llm = None
 _graph = None
 
 
+def _ensure_app():
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
+
+
 def get_db():
     global _db
     if _db is None:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
+        _ensure_app()
         _db = firestore.client()
     return _db
 
@@ -92,8 +96,7 @@ def get_graph():
     global _graph
     if _graph is not None:
         return _graph
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app()
+    _ensure_app()
 
     checkpointer = FirestoreSaver(
         project_id=os.environ.get("GCLOUD_PROJECT"),
@@ -115,12 +118,13 @@ def _require_navigator(req: https_fn.Request) -> dict:
         )
 
     id_token = auth_header[len("Bearer "):]
+    _ensure_app()
     try:
         decoded = fb_auth.verify_id_token(id_token)
-    except Exception:
+    except Exception as e:
         raise https_fn.HttpsError(
             code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-            message="Invalid or expired ID token.",
+            message=f"Invalid or expired ID token: {e}",
         )
 
     uid = decoded.get("uid") or decoded.get("sub")
