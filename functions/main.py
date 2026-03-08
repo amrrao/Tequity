@@ -360,7 +360,7 @@ def build_graph(checkpointer):
     min_instances=0,
     max_instances=10,
     secrets=["GOOGLE_API_KEY"],
-    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST", "OPTIONS"]),
 )
 def message(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
@@ -423,7 +423,7 @@ def message(req: https_fn.Request) -> https_fn.Response:
     min_instances=0,
     max_instances=10,
     secrets=["GOOGLE_API_KEY"],
-    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST", "OPTIONS"]),
 )
 def navigator_reply(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
@@ -477,7 +477,7 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
     min_instances=0,
     max_instances=10,
     secrets=["GOOGLE_API_KEY"],
-    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST", "OPTIONS"]),
 )
 def patient_reply(req: https_fn.Request) -> https_fn.Response:
     """Resume the graph when a patient replies to a navigator's follow-up question."""
