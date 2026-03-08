@@ -60,8 +60,6 @@ class ArulState(TypedDict):
     reply_to_message_id: Optional[str]
     followup_message_id: Optional[str]
 
-# ── Lazy singletons ──────────────────────────────────────────────────────────
-
 _db = None
 _llm = None
 _graph = None
@@ -105,9 +103,6 @@ def get_graph():
     )
     _graph = build_graph(checkpointer)
     return _graph
-
-
-# ── Navigator auth guard ─────────────────────────────────────────────────────
 
 def _require_navigator(req: https_fn.Request) -> dict:
     auth_header = req.headers.get("Authorization", "")
@@ -163,9 +158,6 @@ def _error_response(err: https_fn.HttpsError) -> https_fn.Response:
         status=status,
         mimetype="application/json",
     )
-
-
-# ── Nodes ────────────────────────────────────────────────────────────────────
 
 def intake_node(state: ArulState) -> dict:
     db = get_db()
@@ -303,7 +295,7 @@ def send_followup_node(state: ArulState) -> dict:
         "status":            "awaiting_patient",
         "navigatorResponse": question,
         "replyMessageId":    followup_msg_id,
-        "imessageDelivered": False,   # ← triggers watchFollowupTasks in the iMessage client
+        "imessageDelivered": False,
         "updatedAt":         now,
     })
 
@@ -311,13 +303,6 @@ def send_followup_node(state: ArulState) -> dict:
         {"status": "awaiting_patient", "lastActivity": now},
         merge=True,
     )
-
-    interrupt({
-        "waiting_for":       "patient_reply",
-        "taskId":            state["task_id"],
-        "followupMessageId": followup_msg_id,
-        "question":          question,
-    })
 
     return {"followup_message_id": followup_msg_id}
 
@@ -393,7 +378,7 @@ def format_reply_node(state: ArulState) -> dict:
         "status":            "completed",
         "navigatorResponse": state["navigator_response"],
         "replyMessageId":    reply_msg_id,
-        "imessageDelivered": False,   # ← triggers watchCompletedTasks in the iMessage client
+        "imessageDelivered": False,
         "updatedAt":         now,
     })
 
@@ -423,17 +408,11 @@ def build_graph(checkpointer):
         route_after_navigator,
         {"send_followup": "send_followup", "format_reply": "format_reply"},
     )
-    # After writing the followup question and interrupting, advance to the
-    # receive node which holds the second interrupt (waiting for patient reply).
     g.add_edge("send_followup",          "receive_patient_reply")
-    # Once the patient replies, loop back so the navigator can respond again.
     g.add_edge("receive_patient_reply",  "wait_for_navigator")
     g.add_edge("format_reply",           END)
 
     return g.compile(checkpointer=checkpointer)
-
-
-# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @https_fn.on_request(
     region="us-central1",
