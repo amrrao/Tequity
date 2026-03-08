@@ -96,12 +96,13 @@ def get_graph():
         return _graph
     if not firebase_admin._apps:
         firebase_admin.initialize_app()
-    with FirestoreSaver.from_conn_info(
+    
+    checkpointer = FirestoreSaver(
         project_id=os.environ.get("GCLOUD_PROJECT"),
         checkpoints_collection="lg_checkpoints",
         writes_collection="lg_writes",
-    ) as checkpointer:
-        _graph = build_graph(checkpointer)
+    )
+    _graph = build_graph(checkpointer)
     return _graph
 
 
@@ -191,8 +192,13 @@ def write_task_node(state: ArulState) -> dict:
         "updatedAt":           now,
     })
     db.collection("conversations").document(state["conversation_id"]).set(
-        {"lastActivity": now, "lastMessage": state["raw_message"], "status": "awaiting_navigator"},
-        merge=True,
+    {
+        "lastActivity": now,
+        "lastMessage": state["raw_message"],
+        "status": "awaiting_navigator",
+        "patientId": state["patient_id"],
+    },
+    merge=True,
     )
     ack = URGENT_ACK if state["urgency"] == "urgent" else random.choice(ACK_MESSAGES)
     return {"ack_message": ack}
