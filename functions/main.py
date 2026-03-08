@@ -58,7 +58,7 @@ class ArulState(TypedDict):
     final_message: str
     message_id: str
     reply_to_message_id: Optional[str]
-
+    followup_message_id: Optional[str]
 
 # ── Lazy singletons ──────────────────────────────────────────────────────────
 
@@ -222,14 +222,14 @@ def write_task_node(state: ArulState) -> dict:
     msg_id = state["message_id"]
 
     db.collection("messages").document(msg_id).set({
-        "messageId":      msg_id,
-        "conversationId": state["conversation_id"],
-        "patientId":      state["patient_id"],
-        "sender":         "patient",
-        "body":           state["raw_message"],
+        "messageId":        msg_id,
+        "conversationId":   state["conversation_id"],
+        "patientId":        state["patient_id"],
+        "sender":           "patient",
+        "body":             state["raw_message"],
         "replyToMessageId": state.get("reply_to_message_id") or None,
-        "taskId":         state["task_id"],
-        "createdAt":      now,
+        "taskId":           state["task_id"],
+        "createdAt":        now,
     })
 
     db.collection("tasks").document(state["task_id"]).set({
@@ -247,15 +247,16 @@ def write_task_node(state: ArulState) -> dict:
         "status":              "pending",
         "assignedNavigatorId": state["patient_context"].get("navigator_id") or None,
         "navigatorResponse":   None,
+        "imessageDelivered":   False,
         "createdAt":           now,
         "updatedAt":           now,
     })
     db.collection("conversations").document(state["conversation_id"]).set(
         {
             "lastActivity": now,
-            "lastMessage": state["raw_message"],
-            "status": "awaiting_navigator",
-            "patientId": state["patient_id"],
+            "lastMessage":  state["raw_message"],
+            "status":       "awaiting_navigator",
+            "patientId":    state["patient_id"],
         },
         merge=True,
     )
@@ -286,6 +287,7 @@ def send_followup_node(state: ArulState) -> dict:
     question = (state.get("navigator_response") or "").strip()
 
     followup_msg_id = str(uuid.uuid4())
+
     db.collection("messages").document(followup_msg_id).set({
         "messageId":        followup_msg_id,
         "conversationId":   state["conversation_id"],
@@ -301,51 +303,66 @@ def send_followup_node(state: ArulState) -> dict:
         "status":            "awaiting_patient",
         "navigatorResponse": question,
         "replyMessageId":    followup_msg_id,
+        "imessageDelivered": False,   # ← triggers watchFollowupTasks in the iMessage client
         "updatedAt":         now,
     })
+
     db.collection("conversations").document(state["conversation_id"]).set(
         {"status": "awaiting_patient", "lastActivity": now},
         merge=True,
     )
 
-    patient_reply = interrupt({
+    interrupt({
         "waiting_for":       "patient_reply",
         "taskId":            state["task_id"],
         "followupMessageId": followup_msg_id,
         "question":          question,
     })
 
+    return {"followup_message_id": followup_msg_id}
+
+
+def receive_patient_reply_node(state: ArulState) -> dict:
+    patient_reply_text = interrupt({"waiting_for": "patient_reply_resume"})
+
+    db = get_db()
     new_msg_id = str(uuid.uuid4())
-    now2 = firestore.SERVER_TIMESTAMP
+    now = firestore.SERVER_TIMESTAMP
+    followup_msg_id = state.get("followup_message_id")
 
     db.collection("messages").document(new_msg_id).set({
         "messageId":        new_msg_id,
         "conversationId":   state["conversation_id"],
         "patientId":        state["patient_id"],
         "sender":           "patient",
-        "body":             patient_reply,
+        "body":             patient_reply_text,
         "replyToMessageId": followup_msg_id,
         "taskId":           state["task_id"],
-        "createdAt":        now2,
+        "createdAt":        now,
     })
 
     db.collection("tasks").document(state["task_id"]).update({
-        "status":           "pending",
-        "rawMessage":       patient_reply,
-        "patientReply":     patient_reply,
-        "imessageDelivered": False,
-        "updatedAt":        now2,
+        "status":      "pending",
+        "rawMessage":  patient_reply_text,
+        "patientReply": patient_reply_text,
+        "updatedAt":   now,
     })
+
     db.collection("conversations").document(state["conversation_id"]).set(
-        {"status": "awaiting_navigator", "lastActivity": now2, "lastMessage": patient_reply},
+        {
+            "status":       "awaiting_navigator",
+            "lastActivity": now,
+            "lastMessage":  patient_reply_text,
+        },
         merge=True,
     )
 
     return {
-        "raw_message":        patient_reply,
-        "message_id":         new_msg_id,
-        "navigator_response": None,
-        "navigator_action":   None,
+        "raw_message":          patient_reply_text,
+        "message_id":           new_msg_id,
+        "navigator_response":   None,
+        "navigator_action":     None,
+        "followup_message_id":  None,
     }
 
 
@@ -373,11 +390,13 @@ def format_reply_node(state: ArulState) -> dict:
     })
 
     db.collection("tasks").document(state["task_id"]).update({
-        "status":             "completed",
-        "navigatorResponse":  state["navigator_response"],
-        "replyMessageId":     reply_msg_id,
-        "updatedAt":          now,
+        "status":            "completed",
+        "navigatorResponse": state["navigator_response"],
+        "replyMessageId":    reply_msg_id,
+        "imessageDelivered": False,   # ← triggers watchCompletedTasks in the iMessage client
+        "updatedAt":         now,
     })
+
     db.collection("conversations").document(state["conversation_id"]).set(
         {"status": "resolved", "lastActivity": now},
         merge=True,
@@ -387,20 +406,30 @@ def format_reply_node(state: ArulState) -> dict:
 
 def build_graph(checkpointer):
     g = StateGraph(ArulState)
-    g.add_node("intake",             intake_node)
-    g.add_node("supervisor",         supervisor_node)
-    g.add_node("write_task",         write_task_node)
-    g.add_node("wait_for_navigator", wait_for_navigator_node)
-    g.add_node("send_followup",      send_followup_node)
-    g.add_node("format_reply",       format_reply_node)
-    g.add_edge(START,                "intake")
-    g.add_edge("intake",             "supervisor")
-    g.add_edge("supervisor",         "write_task")
-    g.add_edge("write_task",         "wait_for_navigator")
-    g.add_conditional_edges("wait_for_navigator", route_after_navigator,
-                            {"send_followup": "send_followup", "format_reply": "format_reply"})
-    g.add_edge("send_followup",      "wait_for_navigator")
-    g.add_edge("format_reply",       END)
+    g.add_node("intake",                 intake_node)
+    g.add_node("supervisor",             supervisor_node)
+    g.add_node("write_task",             write_task_node)
+    g.add_node("wait_for_navigator",     wait_for_navigator_node)
+    g.add_node("send_followup",          send_followup_node)
+    g.add_node("receive_patient_reply",  receive_patient_reply_node)
+    g.add_node("format_reply",           format_reply_node)
+
+    g.add_edge(START,                    "intake")
+    g.add_edge("intake",                 "supervisor")
+    g.add_edge("supervisor",             "write_task")
+    g.add_edge("write_task",             "wait_for_navigator")
+    g.add_conditional_edges(
+        "wait_for_navigator",
+        route_after_navigator,
+        {"send_followup": "send_followup", "format_reply": "format_reply"},
+    )
+    # After writing the followup question and interrupting, advance to the
+    # receive node which holds the second interrupt (waiting for patient reply).
+    g.add_edge("send_followup",          "receive_patient_reply")
+    # Once the patient replies, loop back so the navigator can respond again.
+    g.add_edge("receive_patient_reply",  "wait_for_navigator")
+    g.add_edge("format_reply",           END)
+
     return g.compile(checkpointer=checkpointer)
 
 
@@ -449,6 +478,7 @@ def message(req: https_fn.Request) -> https_fn.Response:
                 "final_message":        "",
                 "message_id":           message_id,
                 "reply_to_message_id":  None,
+                "followup_message_id":  None,
             },
             {"configurable": {"thread_id": conversation_id}},
         )
@@ -484,7 +514,6 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
 
-    # ── Verify the caller is an approved navigator ───────────────────────────
     try:
         _require_navigator(req)
     except https_fn.HttpsError as e:
@@ -510,8 +539,8 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
         if action == "followup":
             return https_fn.Response(
                 json.dumps({
-                    "success": True,
-                    "status":  "awaiting_patient",
+                    "success":         True,
+                    "status":          "awaiting_patient",
                     "followupMessage": navigator_response,
                 }),
                 status=200, mimetype="application/json",
