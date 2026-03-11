@@ -1,7 +1,6 @@
 import os
 import json
 import uuid
-import asyncio
 from typing import TypedDict, Optional
 
 import firebase_admin
@@ -194,8 +193,7 @@ def get_graph():
     return _graph
 
 
-
-async def intake_node(state: ArulState) -> dict:
+def intake_node(state: ArulState) -> dict:
     db = get_db()
     doc = db.collection("patients").document(state["patient_id"]).get()
     data = doc.to_dict() if doc.exists else {}
@@ -209,7 +207,7 @@ async def intake_node(state: ArulState) -> dict:
     }
 
 
-async def supervisor_node(state: ArulState) -> dict:
+def supervisor_node(state: ArulState) -> dict:
     from langchain_core.messages import SystemMessage, HumanMessage
     llm = get_llm()
     ctx = state.get("patient_context", {})
@@ -219,7 +217,7 @@ async def supervisor_node(state: ArulState) -> dict:
         treatment_phase=ctx.get("treatment_phase") or "unknown",
         raw_message=state["raw_message"],
     )
-    response = await llm.ainvoke([
+    response = llm.invoke([
         SystemMessage(content="You are a medical care coordination AI. Respond only with valid JSON."),
         HumanMessage(content=prompt),
     ])
@@ -248,7 +246,7 @@ def route_after_supervisor(state: ArulState) -> str:
     return "ai_reply" if state.get("task_type") == "chitchat" else "write_task"
 
 
-async def ai_reply_node(state: ArulState) -> dict:
+def ai_reply_node(state: ArulState) -> dict:
     ctx = state.get("patient_context", {})
     prompt = CHITCHAT_PROMPT.format(
         patient_name=state["patient_name"],
@@ -256,11 +254,11 @@ async def ai_reply_node(state: ArulState) -> dict:
         treatment_phase=ctx.get("treatment_phase") or "unknown",
         raw_message=state["raw_message"],
     )
-    response = await get_llm_warm().ainvoke(prompt)
+    response = get_llm_warm().invoke(prompt)
     return {"ack_message": response.content.strip()}
 
 
-async def write_task_node(state: ArulState) -> dict:
+def write_task_node(state: ArulState) -> dict:
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
     msg_id = state["message_id"]
@@ -324,7 +322,7 @@ async def write_task_node(state: ArulState) -> dict:
                     task_type=state["task_type"],
                     raw_message=state["raw_message"],
                 )
-                response = await get_llm_warm().ainvoke(prompt)
+                response = get_llm_warm().invoke(prompt)
                 ack = response.content.strip()
         except Exception:
             ack = "Got it! Your care team has been notified and will follow up with you soon."
@@ -332,7 +330,7 @@ async def write_task_node(state: ArulState) -> dict:
     return {"ack_message": ack}
 
 
-async def wait_for_navigator_node(state: ArulState) -> dict:
+def wait_for_navigator_node(state: ArulState) -> dict:
     response = interrupt({
         "waiting_for": "navigator_response",
         "taskId":      state["task_id"],
@@ -349,7 +347,7 @@ async def wait_for_navigator_node(state: ArulState) -> dict:
     return {"navigator_response": message, "navigator_action": action}
 
 
-async def send_followup_node(state: ArulState) -> dict:
+def send_followup_node(state: ArulState) -> dict:
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
     question = (state.get("navigator_response") or "").strip()
@@ -423,7 +421,7 @@ def route_after_navigator(state: ArulState) -> str:
     return "send_followup" if state.get("navigator_action") == "followup" else "format_reply"
 
 
-async def format_reply_node(state: ArulState) -> dict:
+def format_reply_node(state: ArulState) -> dict:
     db = get_db()
     reply = (state.get("navigator_response") or "").strip() or "Your care team will follow up shortly."
     now = firestore.SERVER_TIMESTAMP
@@ -476,7 +474,6 @@ def build_graph(checkpointer):
     return g.compile(checkpointer=checkpointer)
 
 
-
 @https_fn.on_request(
     region="us-central1",
     memory=options.MemoryOption.MB_512,
@@ -488,7 +485,7 @@ def build_graph(checkpointer):
     secrets=["GOOGLE_API_KEY"],
     cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
 )
-async def message(req: https_fn.Request) -> https_fn.Response:
+def message(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
     try:
@@ -504,7 +501,7 @@ async def message(req: https_fn.Request) -> https_fn.Response:
             )
         message_id = str(uuid.uuid4())
         graph = get_graph()
-        result = await graph.ainvoke(
+        result = graph.invoke(
             {
                 "raw_message":         raw_message,
                 "patient_id":          patient_id,
@@ -556,7 +553,7 @@ async def message(req: https_fn.Request) -> https_fn.Response:
     secrets=["GOOGLE_API_KEY"],
     cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
 )
-async def navigator_reply(req: https_fn.Request) -> https_fn.Response:
+def navigator_reply(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
     try:
@@ -571,7 +568,7 @@ async def navigator_reply(req: https_fn.Request) -> https_fn.Response:
                 status=400, mimetype="application/json",
             )
         graph = get_graph()
-        result = await graph.ainvoke(
+        result = graph.invoke(
             Command(resume={"action": action, "message": navigator_response}),
             {"configurable": {"thread_id": conversation_id}},
         )
@@ -611,7 +608,7 @@ async def navigator_reply(req: https_fn.Request) -> https_fn.Response:
     secrets=["GOOGLE_API_KEY"],
     cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
 )
-async def patient_reply(req: https_fn.Request) -> https_fn.Response:
+def patient_reply(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
     try:
@@ -625,7 +622,7 @@ async def patient_reply(req: https_fn.Request) -> https_fn.Response:
                 status=400, mimetype="application/json",
             )
         graph = get_graph()
-        result = await graph.ainvoke(
+        result = graph.invoke(
             Command(resume=raw_message),
             {"configurable": {"thread_id": conversation_id}},
         )
@@ -653,11 +650,10 @@ async def patient_reply(req: https_fn.Request) -> https_fn.Response:
     min_instances=0,
     max_instances=10,
     concurrency=80,
-    invoker="public",
     secrets=["GOOGLE_API_KEY"],
-    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["GET", "POST", "OPTIONS"]),
 )
-async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
+def onboard_patient(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
     try:
@@ -669,7 +665,6 @@ async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
                 json.dumps({"error": "Missing: patientId"}),
                 status=400, mimetype="application/json",
             )
-
         db = get_db()
         doc = db.collection("patients").document(patient_id).get()
         if not doc.exists:
@@ -677,24 +672,20 @@ async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
                 json.dumps({"error": "Patient not found"}),
                 status=404, mimetype="application/json",
             )
-
         data            = doc.to_dict()
         patient_name    = data.get("preferredName") or data.get("name") or "there"
         cancer_type     = data.get("cancerType") or "cancer"
         treatment_phase = data.get("treatmentPhase") or "treatment"
-
         prompt = WELCOME_PROMPT.format(
             patient_name=patient_name,
             cancer_type=cancer_type,
             treatment_phase=treatment_phase,
             navigator_name=navigator_name,
         )
-        response = await get_llm_warm().ainvoke(prompt)
+        response = get_llm_warm().invoke(prompt)
         welcome_message = response.content.strip()
-
         now             = firestore.SERVER_TIMESTAMP
         conversation_id = f"conv_onboard_{patient_id}"
-
         db.collection("conversations").document(conversation_id).set({
             "conversationId":   conversation_id,
             "patientId":        patient_id,
@@ -703,7 +694,6 @@ async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
             "lastActivity":     now,
             "welcomeDelivered": False,
         })
-
         msg_id = str(uuid.uuid4())
         db.collection("messages").document(msg_id).set({
             "messageId":      msg_id,
@@ -713,7 +703,6 @@ async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
             "body":           welcome_message,
             "createdAt":      now,
         })
-
         return https_fn.Response(
             json.dumps({
                 "success":        True,
@@ -738,11 +727,10 @@ async def onboard_patient(req: https_fn.Request) -> https_fn.Response:
     min_instances=0,
     max_instances=10,
     concurrency=80,
-    invoker="public",
     secrets=["GOOGLE_API_KEY"],
     cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
 )
-async def classify_message(req: https_fn.Request) -> https_fn.Response:
+def classify_message(req: https_fn.Request) -> https_fn.Response:
     if req.method != "POST":
         return https_fn.Response("Method not allowed", status=405)
     try:
@@ -754,7 +742,6 @@ async def classify_message(req: https_fn.Request) -> https_fn.Response:
                 json.dumps({"error": "Missing: patientId, message"}),
                 status=400, mimetype="application/json",
             )
-
         db = get_db()
         tasks_snap = (
             db.collection("tasks")
@@ -769,30 +756,25 @@ async def classify_message(req: https_fn.Request) -> https_fn.Response:
                 open_convs.append(
                     f"- conversationId: {td['conversationId']} | issue: {td['summary']}"
                 )
-
         if not open_convs:
             return https_fn.Response(
                 json.dumps({"decision": "new", "conversationId": None, "confidence": "high", "reasoning": "No open conversations"}),
                 status=200, mimetype="application/json",
             )
-
         llm = get_llm()
         prompt = CLASSIFIER_PROMPT.format(
             new_message=raw_msg,
             open_conversations="\n".join(open_convs),
         )
-        response = await llm.ainvoke(prompt)
+        response = llm.invoke(prompt)
         raw = response.content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-
         try:
             result = json.loads(raw)
         except json.JSONDecodeError:
             result = {"decision": "new", "conversationId": None, "confidence": "low", "reasoning": "Parse error"}
-
         if result.get("confidence") == "low":
             result["decision"] = "new"
             result["conversationId"] = None
-
         return https_fn.Response(
             json.dumps(result),
             status=200, mimetype="application/json",
