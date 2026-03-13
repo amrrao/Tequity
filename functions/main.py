@@ -145,6 +145,7 @@ class ArulState(TypedDict):
 
 _db = None
 _llm = None
+_llm_warm = None
 _graph = None
 
 
@@ -170,12 +171,15 @@ def get_llm():
 
 
 def get_llm_warm():
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=os.environ.get("GOOGLE_API_KEY"),
-        temperature=0.5,
-    )
+    global _llm_warm
+    if _llm_warm is None:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        _llm_warm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=os.environ.get("GOOGLE_API_KEY"),
+            temperature=0.5,
+        )
+    return _llm_warm
 
 
 def get_graph():
@@ -266,7 +270,10 @@ def write_task_node(state: ArulState) -> dict:
     conv_doc = db.collection("conversations").document(state["conversation_id"]).get()
     is_first_message = not conv_doc.exists
 
-    db.collection("messages").document(msg_id).set({
+    batch = db.batch()
+
+    msg_ref = db.collection("messages").document(msg_id)
+    batch.set(msg_ref, {
         "messageId":        msg_id,
         "conversationId":   state["conversation_id"],
         "patientId":        state["patient_id"],
@@ -277,7 +284,8 @@ def write_task_node(state: ArulState) -> dict:
         "createdAt":        now,
     })
 
-    db.collection("tasks").document(state["task_id"]).set({
+    task_ref = db.collection("tasks").document(state["task_id"])
+    batch.set(task_ref, {
         "taskId":              state["task_id"],
         "patientId":           state["patient_id"],
         "conversationId":      state["conversation_id"],
@@ -298,15 +306,15 @@ def write_task_node(state: ArulState) -> dict:
         "updatedAt":           now,
     })
 
-    db.collection("conversations").document(state["conversation_id"]).set(
-        {
-            "lastActivity": now,
-            "lastMessage":  state["raw_message"],
-            "status":       "awaiting_navigator",
-            "patientId":    state["patient_id"],
-        },
-        merge=True,
-    )
+    conv_ref = db.collection("conversations").document(state["conversation_id"])
+    batch.set(conv_ref, {
+        "lastActivity": now,
+        "lastMessage":  state["raw_message"],
+        "status":       "awaiting_navigator",
+        "patientId":    state["patient_id"],
+    }, merge=True)
+
+    batch.commit()
 
     ack = ""
     if is_first_message:
@@ -347,13 +355,20 @@ def wait_for_navigator_node(state: ArulState) -> dict:
     return {"navigator_response": message, "navigator_action": action}
 
 
-def send_followup_node(state: ArulState) -> dict:
+def route_after_navigator(state: ArulState) -> str:
+    return "write_followup" if state.get("navigator_action") == "followup" else "format_reply"
+
+
+def write_followup_node(state: ArulState) -> dict:
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
     question = (state.get("navigator_response") or "").strip()
-
     followup_msg_id = str(uuid.uuid4())
-    db.collection("messages").document(followup_msg_id).set({
+
+    batch = db.batch()
+
+    msg_ref = db.collection("messages").document(followup_msg_id)
+    batch.set(msg_ref, {
         "messageId":        followup_msg_id,
         "conversationId":   state["conversation_id"],
         "patientId":        state["patient_id"],
@@ -364,17 +379,30 @@ def send_followup_node(state: ArulState) -> dict:
         "createdAt":        now,
     })
 
-    db.collection("tasks").document(state["task_id"]).update({
+    task_ref = db.collection("tasks").document(state["task_id"])
+    batch.set(task_ref, {
         "status":            "awaiting_patient",
         "navigatorResponse": question,
         "replyMessageId":    followup_msg_id,
         "imessageDelivered": False,
         "updatedAt":         now,
-    })
-    db.collection("conversations").document(state["conversation_id"]).set(
-        {"status": "awaiting_patient", "lastActivity": now},
-        merge=True,
-    )
+    }, merge=True)
+
+    conv_ref = db.collection("conversations").document(state["conversation_id"])
+    batch.set(conv_ref, {"status": "awaiting_patient", "lastActivity": now}, merge=True)
+
+    batch.commit()
+
+    return {
+        "navigator_response": question,
+        "message_id":         followup_msg_id,
+    }
+
+
+def send_followup_node(state: ArulState) -> dict:
+    db = get_db()
+    followup_msg_id = state["message_id"]
+    question = (state.get("navigator_response") or "").strip()
 
     patient_reply = interrupt({
         "waiting_for":       "patient_reply",
@@ -386,7 +414,10 @@ def send_followup_node(state: ArulState) -> dict:
     new_msg_id = str(uuid.uuid4())
     now2 = firestore.SERVER_TIMESTAMP
 
-    db.collection("messages").document(new_msg_id).set({
+    batch2 = db.batch()
+
+    new_msg_ref = db.collection("messages").document(new_msg_id)
+    batch2.set(new_msg_ref, {
         "messageId":        new_msg_id,
         "conversationId":   state["conversation_id"],
         "patientId":        state["patient_id"],
@@ -397,17 +428,22 @@ def send_followup_node(state: ArulState) -> dict:
         "createdAt":        now2,
     })
 
-    db.collection("tasks").document(state["task_id"]).update({
-        "status":            "pending",
-        "rawMessage":        patient_reply,
-        "patientReply":      patient_reply,
-        "imessageDelivered": False,
-        "updatedAt":         now2,
-    })
-    db.collection("conversations").document(state["conversation_id"]).set(
-        {"status": "awaiting_navigator", "lastActivity": now2, "lastMessage": patient_reply},
-        merge=True,
-    )
+    task_ref2 = db.collection("tasks").document(state["task_id"])
+    batch2.set(task_ref2, {
+        "status":       "pending",
+        "rawMessage":   patient_reply,
+        "patientReply": patient_reply,
+        "updatedAt":    now2,
+    }, merge=True)
+
+    conv_ref2 = db.collection("conversations").document(state["conversation_id"])
+    batch2.set(conv_ref2, {
+        "status":       "awaiting_navigator",
+        "lastActivity": now2,
+        "lastMessage":  patient_reply,
+    }, merge=True)
+
+    batch2.commit()
 
     return {
         "raw_message":        patient_reply,
@@ -417,17 +453,17 @@ def send_followup_node(state: ArulState) -> dict:
     }
 
 
-def route_after_navigator(state: ArulState) -> str:
-    return "send_followup" if state.get("navigator_action") == "followup" else "format_reply"
-
-
 def format_reply_node(state: ArulState) -> dict:
     db = get_db()
     reply = (state.get("navigator_response") or "").strip() or "Your care team will follow up shortly."
     now = firestore.SERVER_TIMESTAMP
 
     reply_msg_id = str(uuid.uuid4())
-    db.collection("messages").document(reply_msg_id).set({
+
+    batch = db.batch()
+
+    msg_ref = db.collection("messages").document(reply_msg_id)
+    batch.set(msg_ref, {
         "messageId":        reply_msg_id,
         "conversationId":   state["conversation_id"],
         "patientId":        state["patient_id"],
@@ -438,17 +474,20 @@ def format_reply_node(state: ArulState) -> dict:
         "createdAt":        now,
     })
 
-    db.collection("tasks").document(state["task_id"]).update({
+    task_ref = db.collection("tasks").document(state["task_id"])
+    batch.set(task_ref, {
         "status":            "completed",
-        "navigatorResponse": state["navigator_response"],
+        "navigatorResponse": reply,
         "replyMessageId":    reply_msg_id,
         "imessageDelivered": False,
         "updatedAt":         now,
-    })
-    db.collection("conversations").document(state["conversation_id"]).set(
-        {"status": "resolved", "lastActivity": now},
-        merge=True,
-    )
+    }, merge=True)
+
+    conv_ref = db.collection("conversations").document(state["conversation_id"])
+    batch.set(conv_ref, {"status": "resolved", "lastActivity": now}, merge=True)
+
+    batch.commit()
+
     return {"final_message": reply, "reply_to_message_id": state["message_id"]}
 
 
@@ -459,6 +498,7 @@ def build_graph(checkpointer):
     g.add_node("ai_reply",           ai_reply_node)
     g.add_node("write_task",         write_task_node)
     g.add_node("wait_for_navigator", wait_for_navigator_node)
+    g.add_node("write_followup",     write_followup_node)
     g.add_node("send_followup",      send_followup_node)
     g.add_node("format_reply",       format_reply_node)
     g.add_edge(START,                "intake")
@@ -468,7 +508,8 @@ def build_graph(checkpointer):
     g.add_edge("ai_reply",           END)
     g.add_edge("write_task",         "wait_for_navigator")
     g.add_conditional_edges("wait_for_navigator", route_after_navigator,
-                            {"send_followup": "send_followup", "format_reply": "format_reply"})
+                            {"write_followup": "write_followup", "format_reply": "format_reply"})
+    g.add_edge("write_followup",     "send_followup")
     g.add_edge("send_followup",      "wait_for_navigator")
     g.add_edge("format_reply",       END)
     return g.compile(checkpointer=checkpointer)
@@ -621,6 +662,19 @@ def patient_reply(req: https_fn.Request) -> https_fn.Response:
                 json.dumps({"error": "Missing: conversationId, message, patientId"}),
                 status=400, mimetype="application/json",
             )
+        db = get_db()
+        task_snap = list(
+            db.collection("tasks")
+            .where("conversationId", "==", conversation_id)
+            .where("status", "==", "awaiting_patient")
+            .limit(1)
+            .stream()
+        )
+        if not task_snap:
+            return https_fn.Response(
+                json.dumps({"error": "No awaiting_patient task found for this conversation"}),
+                status=409, mimetype="application/json",
+            )
         graph = get_graph()
         result = graph.invoke(
             Command(resume=raw_message),
@@ -676,6 +730,15 @@ def onboard_patient(req: https_fn.Request) -> https_fn.Response:
         patient_name    = data.get("preferredName") or data.get("name") or "there"
         cancer_type     = data.get("cancerType") or "cancer"
         treatment_phase = data.get("treatmentPhase") or "treatment"
+
+        conversation_id = f"conv_onboard_{patient_id}"
+        existing = db.collection("conversations").document(conversation_id).get()
+        if existing.exists and existing.to_dict().get("welcomeDelivered"):
+            return https_fn.Response(
+                json.dumps({"error": "Patient already onboarded"}),
+                status=409, mimetype="application/json",
+            )
+
         prompt = WELCOME_PROMPT.format(
             patient_name=patient_name,
             cancer_type=cancer_type,
@@ -685,17 +748,23 @@ def onboard_patient(req: https_fn.Request) -> https_fn.Response:
         response = get_llm_warm().invoke(prompt)
         welcome_message = response.content.strip()
         now             = firestore.SERVER_TIMESTAMP
-        conversation_id = f"conv_onboard_{patient_id}"
-        db.collection("conversations").document(conversation_id).set({
+
+        batch = db.batch()
+
+        conv_ref = db.collection("conversations").document(conversation_id)
+        batch.set(conv_ref, {
             "conversationId":   conversation_id,
             "patientId":        patient_id,
             "status":           "awaiting_patient",
             "lastMessage":      welcome_message,
             "lastActivity":     now,
             "welcomeDelivered": False,
+            "navigatorName":    navigator_name,
         })
+
         msg_id = str(uuid.uuid4())
-        db.collection("messages").document(msg_id).set({
+        msg_ref = db.collection("messages").document(msg_id)
+        batch.set(msg_ref, {
             "messageId":      msg_id,
             "conversationId": conversation_id,
             "patientId":      patient_id,
@@ -703,6 +772,9 @@ def onboard_patient(req: https_fn.Request) -> https_fn.Response:
             "body":           welcome_message,
             "createdAt":      now,
         })
+
+        batch.commit()
+
         return https_fn.Response(
             json.dumps({
                 "success":        True,
@@ -747,6 +819,8 @@ def classify_message(req: https_fn.Request) -> https_fn.Response:
             db.collection("tasks")
             .where("patientId", "==", patient_id)
             .where("status", "in", ["pending", "awaiting_patient"])
+            .order_by("createdAt", direction=firestore.Query.DESCENDING)
+            .limit(10)
             .stream()
         )
         open_convs = []
