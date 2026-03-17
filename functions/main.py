@@ -141,6 +141,7 @@ class ArulState(TypedDict):
     message_id: str
     reply_to_message_id: Optional[str]
     is_ambiguous: bool
+    is_outbound: bool
 
 
 _db = None
@@ -247,7 +248,13 @@ def supervisor_node(state: ArulState) -> dict:
 
 
 def route_after_supervisor(state: ArulState) -> str:
+    if state.get("is_outbound"):
+        return "write_task"
     return "ai_reply" if state.get("task_type") == "chitchat" else "write_task"
+
+
+def route_after_write_task(state: ArulState) -> str:
+    return "format_outbound" if state.get("is_outbound") else "wait_for_navigator"
 
 
 def ai_reply_node(state: ArulState) -> dict:
@@ -266,23 +273,25 @@ def write_task_node(state: ArulState) -> dict:
     db = get_db()
     now = firestore.SERVER_TIMESTAMP
     msg_id = state["message_id"]
+    is_outbound = state.get("is_outbound", False)
 
     conv_doc = db.collection("conversations").document(state["conversation_id"]).get()
     is_first_message = not conv_doc.exists
 
     batch = db.batch()
 
-    msg_ref = db.collection("messages").document(msg_id)
-    batch.set(msg_ref, {
-        "messageId":        msg_id,
-        "conversationId":   state["conversation_id"],
-        "patientId":        state["patient_id"],
-        "sender":           "patient",
-        "body":             state["raw_message"],
-        "replyToMessageId": state.get("reply_to_message_id") or None,
-        "taskId":           state["task_id"],
-        "createdAt":        now,
-    })
+    if not is_outbound:
+        msg_ref = db.collection("messages").document(msg_id)
+        batch.set(msg_ref, {
+            "messageId":        msg_id,
+            "conversationId":   state["conversation_id"],
+            "patientId":        state["patient_id"],
+            "sender":           "patient",
+            "body":             state["raw_message"],
+            "replyToMessageId": state.get("reply_to_message_id") or None,
+            "taskId":           state["task_id"],
+            "createdAt":        now,
+        })
 
     task_ref = db.collection("tasks").document(state["task_id"])
     batch.set(task_ref, {
@@ -310,14 +319,14 @@ def write_task_node(state: ArulState) -> dict:
     batch.set(conv_ref, {
         "lastActivity": now,
         "lastMessage":  state["raw_message"],
-        "status":       "awaiting_navigator",
+        "status":       "awaiting_navigator" if not is_outbound else "awaiting_patient",
         "patientId":    state["patient_id"],
     }, merge=True)
 
     batch.commit()
 
     ack = ""
-    if is_first_message:
+    if is_first_message and not is_outbound:
         try:
             ctx = state.get("patient_context", {})
             if state["urgency"] == "urgent":
@@ -336,6 +345,40 @@ def write_task_node(state: ArulState) -> dict:
             ack = "Got it! Your care team has been notified and will follow up with you soon."
 
     return {"ack_message": ack}
+
+
+def format_outbound_node(state: ArulState) -> dict:
+    db = get_db()
+    now = firestore.SERVER_TIMESTAMP
+    msg_id = state["message_id"]
+
+    batch = db.batch()
+
+    msg_ref = db.collection("messages").document(msg_id)
+    batch.set(msg_ref, {
+        "messageId":        msg_id,
+        "conversationId":   state["conversation_id"],
+        "patientId":        state["patient_id"],
+        "sender":           "navigator",
+        "body":             state["raw_message"],
+        "replyToMessageId": None,
+        "taskId":           state["task_id"],
+        "createdAt":        now,
+    })
+
+    task_ref = db.collection("tasks").document(state["task_id"])
+    batch.set(task_ref, {
+        "status":            "completed",
+        "navigatorResponse": state["raw_message"],
+        "replyMessageId":    msg_id,
+        "imessageDelivered": False,
+        "isOutbound":        True,
+        "updatedAt":         now,
+    }, merge=True)
+
+    batch.commit()
+
+    return {"final_message": state["raw_message"]}
 
 
 def wait_for_navigator_node(state: ArulState) -> dict:
@@ -497,6 +540,7 @@ def build_graph(checkpointer):
     g.add_node("supervisor",         supervisor_node)
     g.add_node("ai_reply",           ai_reply_node)
     g.add_node("write_task",         write_task_node)
+    g.add_node("format_outbound",    format_outbound_node)
     g.add_node("wait_for_navigator", wait_for_navigator_node)
     g.add_node("write_followup",     write_followup_node)
     g.add_node("send_followup",      send_followup_node)
@@ -506,7 +550,9 @@ def build_graph(checkpointer):
     g.add_conditional_edges("supervisor", route_after_supervisor,
                             {"ai_reply": "ai_reply", "write_task": "write_task"})
     g.add_edge("ai_reply",           END)
-    g.add_edge("write_task",         "wait_for_navigator")
+    g.add_conditional_edges("write_task", route_after_write_task,
+                            {"format_outbound": "format_outbound", "wait_for_navigator": "wait_for_navigator"})
+    g.add_edge("format_outbound",    END)
     g.add_conditional_edges("wait_for_navigator", route_after_navigator,
                             {"write_followup": "write_followup", "format_reply": "format_reply"})
     g.add_edge("write_followup",     "send_followup")
@@ -562,6 +608,7 @@ def message(req: https_fn.Request) -> https_fn.Response:
                 "message_id":          message_id,
                 "reply_to_message_id": None,
                 "is_ambiguous":        is_ambiguous,
+                "is_outbound":         False,
             },
             {"configurable": {"thread_id": conversation_id}},
         )
@@ -851,6 +898,135 @@ def classify_message(req: https_fn.Request) -> https_fn.Response:
             result["conversationId"] = None
         return https_fn.Response(
             json.dumps(result),
+            status=200, mimetype="application/json",
+        )
+    except Exception as e:
+        return https_fn.Response(
+            json.dumps({"success": False, "error": str(e)}),
+            status=500, mimetype="application/json",
+        )
+
+
+@https_fn.on_request(
+    region="us-central1",
+    memory=options.MemoryOption.MB_512,
+    timeout_sec=120,
+    cpu=1,
+    min_instances=0,
+    max_instances=10,
+    concurrency=80,
+    secrets=["GOOGLE_API_KEY"],
+    cors=options.CorsOptions(cors_origins=["*"], cors_methods=["POST"]),
+)
+def outbound_message(req: https_fn.Request) -> https_fn.Response:
+    if req.method != "POST":
+        return https_fn.Response("Method not allowed", status=405)
+    try:
+        body                  = req.get_json(silent=True) or {}
+        patient_id            = str(body.get("patientId", "")).strip()
+        conversation_id       = str(body.get("conversationId", "")).strip()
+        raw_message           = str(body.get("message", "")).strip()
+        navigator_id          = str(body.get("navigatorId", "")).strip()
+        is_existing_conversation = bool(body.get("isExistingConversation", False))
+        if not all([patient_id, conversation_id, raw_message, navigator_id]):
+            return https_fn.Response(
+                json.dumps({"error": "Missing: patientId, conversationId, message, navigatorId"}),
+                status=400, mimetype="application/json",
+            )
+
+        db = get_db()
+        message_id = str(uuid.uuid4())
+        now = firestore.SERVER_TIMESTAMP
+
+        if is_existing_conversation:
+            batch = db.batch()
+
+            msg_ref = db.collection("messages").document(message_id)
+            batch.set(msg_ref, {
+                "messageId":        message_id,
+                "conversationId":   conversation_id,
+                "patientId":        patient_id,
+                "sender":           "navigator",
+                "body":             raw_message,
+                "replyToMessageId": None,
+                "taskId":           None,
+                "createdAt":        now,
+            })
+
+            task_id = str(uuid.uuid4())
+            task_ref = db.collection("tasks").document(task_id)
+            batch.set(task_ref, {
+                "taskId":            task_id,
+                "patientId":         patient_id,
+                "conversationId":    conversation_id,
+                "messageId":         message_id,
+                "rawMessage":        raw_message,
+                "status":            "completed",
+                "navigatorResponse": raw_message,
+                "replyMessageId":    message_id,
+                "imessageDelivered": False,
+                "isOutbound":        True,
+                "taskType":          "general",
+                "urgency":           "routine",
+                "summary":           f"Navigator sent proactive message: {raw_message[:80]}",
+                "navigatorNotes":    "",
+                "extractedEntities": {},
+                "ambiguous":         False,
+                "createdAt":         now,
+                "updatedAt":         now,
+            })
+
+            conv_ref = db.collection("conversations").document(conversation_id)
+            batch.set(conv_ref, {
+                "lastActivity": now,
+                "lastMessage":  raw_message,
+                "status":       "awaiting_patient",
+            }, merge=True)
+
+            batch.commit()
+
+            return https_fn.Response(
+                json.dumps({
+                    "success":        True,
+                    "messageId":      message_id,
+                    "conversationId": conversation_id,
+                    "taskId":         task_id,
+                }),
+                status=200, mimetype="application/json",
+            )
+
+        graph = get_graph()
+        result = graph.invoke(
+            {
+                "raw_message":         raw_message,
+                "patient_id":          patient_id,
+                "conversation_id":     conversation_id,
+                "patient_name":        "",
+                "patient_context":     {},
+                "task_id":             "",
+                "task_type":           "unclear",
+                "urgency":             "routine",
+                "summary":             "",
+                "navigator_notes":     "",
+                "extracted_entities":  {},
+                "ack_message":         "",
+                "navigator_response":  None,
+                "navigator_action":    None,
+                "final_message":       "",
+                "message_id":          message_id,
+                "reply_to_message_id": None,
+                "is_ambiguous":        False,
+                "is_outbound":         True,
+            },
+            {"configurable": {"thread_id": conversation_id}},
+        )
+        return https_fn.Response(
+            json.dumps({
+                "success":        True,
+                "messageId":      message_id,
+                "conversationId": conversation_id,
+                "taskId":         result.get("task_id", ""),
+            }),
             status=200, mimetype="application/json",
         )
     except Exception as e:
