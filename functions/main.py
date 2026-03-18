@@ -9,6 +9,7 @@ from firebase_functions import https_fn, options
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
 from langgraph_checkpoint_firestore import FirestoreSaver
+from gmail_oauth import generate_gmail_oauth_url, gmail_oauth_callback, send_gmail_on_behalf
 
 URGENT_ACK = "This sounds urgent — I'm flagging it for your care team right now. Someone will be with you very shortly."
 
