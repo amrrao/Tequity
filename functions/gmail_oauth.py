@@ -163,7 +163,7 @@ def gmail_oauth_callback(req: https_fn.Request) -> https_fn.Response:
     if not refresh_token:
         return _html_page("Something went wrong", "Google did not return a refresh token. Please try the link again.")
 
-    patient_email = _get_email_from_id_token(token_data.get("id_token", ""))
+    patient_email = _get_email_from_id_token(token_data.get("id_token", ""))    
     encrypted = encrypt_token(refresh_token)
 
     get_db().collection("patients").document(patient_id) \
@@ -224,7 +224,7 @@ def send_gmail_on_behalf(req: https_fn.Request) -> https_fn.Response:
             status=500, content_type="application/json",
         )
 
-    patient_email = gmail_doc.get("email", "me")
+    patient_email = gmail_doc.get("email") or "me"
     raw_message   = _build_raw_email(patient_email, to, subject, email_body)
     result        = _gmail_send(access_token, raw_message)
 
