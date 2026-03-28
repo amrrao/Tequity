@@ -63,28 +63,16 @@ def build_graph(checkpointer):
     g.add_edge(START, "intake")
     g.add_edge("intake", "supervisor")
     
-    g.add_conditional_edges(
-        "supervisor",
-        route_from_supervisor,
-        SUPERVISOR_ROUTES
-    )
-    
+    g.add_conditional_edges("supervisor", route_from_supervisor)
+
     g.add_edge("ai_reply", END)
-    
-    g.add_conditional_edges(
-        "write_task",
-        route_after_write_task,
-        POST_TASK_ROUTES
-    )
-    
+
+    g.add_conditional_edges("write_task", route_after_write_task)
+
     g.add_edge("generate_ack", "wait_for_navigator")
     g.add_edge("format_outbound", END)
-    
-    g.add_conditional_edges(
-        "wait_for_navigator",
-        route_after_navigator,
-        NAVIGATOR_ROUTES
-    )
+
+    g.add_conditional_edges("wait_for_navigator", route_after_navigator)
     
     g.add_edge("write_followup", "wait_for_patient")
     g.add_edge("wait_for_patient", "wait_for_navigator")
