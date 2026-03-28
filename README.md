@@ -272,14 +272,20 @@ navigatorId:     "navigator_001"
 ## Project Structure
 
 ```
-arul-orchestrator/
-├── functions/
-│   ├── main.py           ← all orchestration logic
-│   ├── requirements.txt  ← Python dependencies
-│   └── venv/             ← local virtual environment (not committed)
-├── firebase.json
-├── .firebaserc
-└── README.md
+functions/
+  main.py          # HTTP handlers, dedup, request/response logic
+  state.py         # ArulState TypedDict and type literals
+  prompts.py       # All LLM prompt templates
+  nodes.py         # Graph node functions (business logic)
+  graph.py         # Graph builder, routing dicts, routing functions
+  services.py      # Lazy singletons (DB, LLM, checkpointer, graph)
+  gmail_oauth.py   # Gmail OAuth endpoints
+  requirements.txt # Python dependencies
+firebase.json
+.firebaserc
+ARCHITECTURE.md    # Detailed architecture docs
+REFACTOR.md        # Sprint scope document
+test_e2e.py        # End-to-end test suite
 ```
 
 ---
@@ -287,13 +293,19 @@ arul-orchestrator/
 ## Local Development
 
 ```bash
-cd functions
-venv/Scripts/pip install -r requirements.txt   # Windows
-# or
-venv/bin/pip install -r requirements.txt       # Mac/Linux
+# Install dependencies
+cd functions && pip install -r requirements.txt
+
+# Start emulator (requires firebase-tools: npm install -g firebase-tools)
+firebase emulators:start --only functions
+
+# Run E2E tests (requires patient_001 seeded in Firestore)
+python test_e2e.py
 ```
 
 To redeploy after changes:
 ```bash
 firebase deploy --only functions
 ```
+
+See `ARCHITECTURE.md` for detailed architecture documentation.

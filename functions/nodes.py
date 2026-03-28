@@ -91,9 +91,6 @@ def write_task_node(state: ArulState) -> dict:
     msg_id = state["message_id"]
     is_outbound = state.get("is_outbound", False)
 
-    conv_doc = db.collection("conversations").document(state["conversation_id"]).get()
-    is_first_message = not conv_doc.exists
-
     batch = db.batch()
 
     if not is_outbound:

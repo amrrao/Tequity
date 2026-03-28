@@ -10,11 +10,15 @@ _checkpointer = None
 _graph = None
 
 
+def _ensure_firebase():
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
+
+
 def get_db():
     global _db
     if _db is None:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
+        _ensure_firebase()
         _db = firestore.client()
     return _db
 
@@ -46,8 +50,7 @@ def get_llm_warm():
 def get_checkpointer():
     global _checkpointer
     if _checkpointer is None:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
+        _ensure_firebase()
         _checkpointer = FirestoreSaver(
             project_id=os.environ.get("GCLOUD_PROJECT"),
             checkpoints_collection="lg_checkpoints",
@@ -61,6 +64,5 @@ def get_graph():
     if _graph is not None:
         return _graph
     from graph import build_graph
-    checkpointer = get_checkpointer()
-    _graph = build_graph(checkpointer)
+    _graph = build_graph(get_checkpointer())
     return _graph
