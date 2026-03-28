@@ -1,5 +1,6 @@
-import os
+import hashlib
 import json
+import logging
 import uuid
 from firebase_admin import firestore
 from firebase_functions import https_fn, options
@@ -8,6 +9,8 @@ from langgraph.types import Command
 from gmail_oauth import generate_gmail_oauth_url, gmail_oauth_callback, send_gmail_on_behalf
 from services import get_db, get_llm, get_llm_warm, get_graph
 from prompts import WELCOME_PROMPT, CLASSIFIER_PROMPT
+
+log = logging.getLogger(__name__)
 
 
 def _check_dedup(db, dedup_key):
@@ -63,7 +66,8 @@ def message(req: https_fn.Request) -> https_fn.Response:
         
         message_id = str(uuid.uuid4())
         db = get_db()
-        dedup_key = f"msg_{conversation_id}_{message_id}"
+        msg_hash = hashlib.sha256(raw_message.encode()).hexdigest()[:16]
+        dedup_key = f"msg_{conversation_id}_{msg_hash}"
         
         cached = _check_dedup(db, dedup_key)
         if cached:
@@ -117,8 +121,9 @@ def message(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )
 
@@ -151,7 +156,7 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
             )
         
         db = get_db()
-        dedup_key = f"nav_{conversation_id}_{hash(navigator_response)}"
+        dedup_key = f"nav_{conversation_id}_{hashlib.sha256(navigator_response.encode()).hexdigest()[:16]}"
         
         cached = _check_dedup(db, dedup_key)
         if cached:
@@ -189,8 +194,9 @@ def navigator_reply(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )
 
@@ -236,7 +242,7 @@ def patient_reply(req: https_fn.Request) -> https_fn.Response:
                 status=409, mimetype="application/json",
             )
         
-        dedup_key = f"pat_{conversation_id}_{hash(raw_message)}"
+        dedup_key = f"pat_{conversation_id}_{hashlib.sha256(raw_message.encode()).hexdigest()[:16]}"
         
         cached = _check_dedup(db, dedup_key)
         if cached:
@@ -267,8 +273,9 @@ def patient_reply(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )
 
@@ -365,8 +372,9 @@ def onboard_patient(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )
 
@@ -426,7 +434,7 @@ def classify_message(req: https_fn.Request) -> https_fn.Response:
             open_conversations="\n".join(open_convs),
         )
         response = llm.invoke(prompt)
-        raw = response.content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        raw = response.content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         
         try:
             result = json.loads(raw)
@@ -442,8 +450,9 @@ def classify_message(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )
 
@@ -573,7 +582,8 @@ def outbound_message(req: https_fn.Request) -> https_fn.Response:
             status=200, mimetype="application/json",
         )
     except Exception as e:
+        log.exception("request failed")
         return https_fn.Response(
-            json.dumps({"success": False, "error": str(e)}),
+            json.dumps({"success": False, "error": "Internal server error"}),
             status=500, mimetype="application/json",
         )

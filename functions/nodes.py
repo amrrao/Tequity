@@ -47,7 +47,7 @@ def supervisor_node(state: ArulState) -> dict:
         SystemMessage(content="You are a medical care coordination AI. Respond only with valid JSON."),
         HumanMessage(content=prompt),
     ])
-    raw = response.content.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+    raw = response.content.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -146,9 +146,17 @@ def write_task_node(state: ArulState) -> dict:
 
 def generate_ack_node(state: ArulState) -> dict:
     db = get_db()
-    conv_doc = db.collection("conversations").document(state["conversation_id"]).get()
-    is_first_message = not conv_doc.exists or not conv_doc.to_dict().get("lastActivity")
-    
+    # Check message count rather than conversation doc existence, because
+    # write_task_node already created/updated the conversation doc before us.
+    existing_msgs = list(
+        db.collection("messages")
+        .where("conversationId", "==", state["conversation_id"])
+        .where("sender", "==", "patient")
+        .limit(2)
+        .stream()
+    )
+    is_first_message = len(existing_msgs) <= 1
+
     if not is_first_message:
         return {"ack_message": ""}
     
